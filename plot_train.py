@@ -30,7 +30,7 @@ with open(csv_filename, "r", newline="") as f:
 
 fig, ax = plt.subplots(1, 2, figsize=(12, 4))
 
-# -------- Left: Loss curves --------
+# Left: Loss curves
 ax[0].plot(epochs, train_loss_avgs, label="Total")
 ax[0].plot(epochs, train_sup_avgs, label="Supervised")
 ax[0].plot(epochs, train_cons_avgs, label="Consistency")
@@ -45,7 +45,7 @@ step = max(1, n // 10)
 ax[0].set_xticks(epochs[::step])
 
 
-# -------- Right: Valid fraction --------
+# Right: Valid fraction
 ax[1].plot(epochs, valid_frac_avgs, label="Valid Fraction")
 
 ax[1].set_title("Valid Fraction per Epoch")
@@ -57,4 +57,5 @@ ax[1].set_xticks(epochs[::step])
 
 
 fig.tight_layout()
+
 plt.show()
