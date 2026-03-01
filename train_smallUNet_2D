@@ -1,0 +1,263 @@
+import numpy as np
+import zarr
+import math
+import torch
+import copy
+import torch.nn.functional as F
+from monai.data import Dataset, DataLoader
+from scipy.ndimage import distance_transform_edt
+from monai.transforms import (
+    Compose, SpatialPadd, ScaleIntensityRangePercentilesd,
+    RandCropByPosNegLabeld, RandFlipd, RandGaussianNoised, ToTensord
+)
+from monai.networks.nets import UNet
+from torch.optim import AdamW
+import os
+import csv
+import matplotlib.pyplot as plt
+
+
+def build_smallUNet(in_channels=1, out_channels=1):
+    return UNet(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        spatial_dims=2,
+        channels=(16, 32, 64),
+        strides=(1, 1),
+        num_res_units=0,
+    )
+
+class zarr3Ddataset(Dataset):
+    def __init__(self, zarr_path, num_pos=1):
+        self.zarr_file = zarr.open(zarr_path, mode='r')
+        self.keys = list(self.zarr_file.keys())
+        self.index_map = []
+
+        for k in self.keys:
+            grp = self.zarr_file[k]
+            mask = grp["mask"]
+            raw = grp["raw"]
+            z_size = mask.shape[0]
+            for z in range(z_size):
+                if np.asarray(mask[z]).sum() > num_pos:
+                    self.index_map.append((k, z)) 
+
+    def __len__(self):
+        return len(self.index_map)
+    
+    def __getitem__(self, idx):
+        k, z = self.index_map[idx]
+        grp = self.zarr_file[k]
+
+        mask2d = np.asarray(grp["mask"][z]) # (H, W)
+        raw = np.asarray(grp["raw"][z])     # (H, W)
+
+        mask2d = (mask2d == 1).astype(np.float32)
+        raw = raw.astype(np.float32)
+
+        label = np.expand_dims(mask2d, axis=0)
+        raw = np.expand_dims(raw, axis=0)
+
+        return {"image": raw, "label":label}
+
+
+PH, PW = 32, 32
+
+train_trfm = Compose([
+    SpatialPadd(keys=["image", "label"], spatial_size=(PH, PW), mode="constant"),
+    ScaleIntensityRangePercentilesd(keys="image", lower=5, upper=95, b_min=0.0, b_max=1.0, clip=True),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=(PH, PW),
+        pos=0.8, neg=0.2,
+        num_samples=4,
+    ),
+    # RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0), # H fliping
+    # RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1), # W fliping
+    # RandGaussianNoised(keys="image", prob=0.2, mean=0.0, std=0.01),
+    ToTensord(keys=["image", "label"]),
+     ])
+
+
+def masked_bce_dice_loss(logits, target, eps=1e-6):
+    # size of inputs are (B, 1, H, W) 
+    dims = (1, 2, 3)
+
+    bce = F.binary_cross_entropy_with_logits(logits, target)
+    prob = torch.sigmoid(logits)
+
+    inter = (prob * target).sum(dim=dims)
+    denom = prob.sum(dim=dims) + target.sum(dim=dims) + eps
+    dice = 1.0 - (2.0 * inter + eps) / denom
+    dice = dice.mean()
+
+    return bce + dice
+
+
+
+def train_smallUNet(
+    train_loader: DataLoader,
+    val_loader: DataLoader | None = None,
+    device: str = "cuda",
+    max_epochs: int = 200,
+    lr: float = 1e-4,
+    weight_decay: float = 1e-5,
+    log_every: int = 20,
+    checkpoint_path: str = "",
+    available_checkpoint=None
+):
+    os.makedirs(checkpoint_path, exist_ok=True)
+    bestmodel_filename = os.path.join(checkpoint_path, "best_model.pth")
+    csv_file = os.path.join(checkpoint_path, "metrics.csv")
+
+    # CSV header
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch", "global_step",
+            "train_loss_avg",
+            "val_loss_avg",
+            "label_avg"
+        ])
+
+    model = build_smallUNet().to(device)
+    if available_checkpoint:
+        chk = torch.load(available_checkpoint, map_location=device)
+        model.load_state_dict(chk["student_state_dict"])
+
+    opt = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    use_amp = device.startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    global_step = 0
+    best_score = float("inf")  # val if available else train
+
+    for epoch in range(max_epochs):
+        model.train()
+
+        run_loss = 0.0
+        run_label_frac = 0.0
+        n_steps = 0
+
+        for step, batch in enumerate(train_loader):
+            x = batch["image"].to(device)
+            y = batch["label"].to(device)
+
+            if 0:
+                x_np = x.detach().cpu().numpy()[0][0] 
+                y_np = y.detach().cpu().numpy()[0][0]
+                fig, ax = plt.subplots(1, 2, figsize=(9, 4))
+                ax[0].imshow(x_np, cmap="gray")
+                ax[0].imshow(y_np, alpha=0.3)
+                ax[1].imshow(y_np)
+                ax[0].set_title("image")
+                ax[1].set_title("label")
+                plt.show()
+
+            # batch stats (averaged over epoch)
+            label_frac = (y.sum() / (y.numel() + 1e-6)).item()
+            run_label_frac += label_frac
+
+            opt.zero_grad(set_to_none=True)
+
+            if use_amp:
+                with torch.cuda.amp.autocast(enabled=True):
+                    s_logits = model(x)
+                    loss = masked_bce_dice_loss(s_logits, y)
+
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                s_logits = model(x)
+                loss = masked_bce_dice_loss(s_logits, y)
+
+                loss.backward()
+                opt.step()
+
+            # accumulate epoch averages
+            run_loss += loss.item()
+            n_steps += 1
+
+            if (step % log_every) == 0:
+                print(
+                    f"epoch {epoch:03d} step {step:04d} | "
+                    f"loss={loss.item():.4f} | "
+                    f"label_frac={label_frac:.3f}"
+                )
+
+            global_step += 1
+
+        # compute averages
+        train_loss_avg = run_loss / max(n_steps, 1)
+        label_frac_avg = run_label_frac / max(n_steps, 1)
+
+        # validation once per epoch
+        val_loss_avg = None
+        if val_loader is not None:
+            model.eval()
+            vloss = 0.0
+            vsteps = 0
+            with torch.no_grad():
+                for vb in val_loader:
+                    vx = vb["image"].to(device)
+                    vy = vb["label"].to(device)
+                    vlogits = model(vx)
+                    L = masked_bce_dice_loss(vlogits, vy)
+                    vloss += L.item()
+                    vsteps += 1
+            val_loss_avg = vloss / max(vsteps, 1)
+            print(f"[VAL] epoch {epoch:03d} loss={val_loss_avg:.4f}")
+
+        # checkpointing: save best by val if available
+        score = val_loss_avg if val_loss_avg is not None else train_loss_avg
+
+        checkpoint = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "network_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "best_score": best_score,
+        }
+
+        torch.save(checkpoint, os.path.join(checkpoint_path, f"checkpoint_epoch_{epoch:03d}.pth"))
+
+        if score < best_score:
+            best_score = score
+            checkpoint["best_score"] = best_score
+            torch.save(checkpoint, bestmodel_filename)
+            print(f"[BEST] epoch {epoch:03d} score={best_score:.4f} -> saved best_model.pth")
+
+        with open(csv_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch, global_step,
+                train_loss_avg,
+                val_loss_avg if val_loss_avg is not None else "",
+                label_frac_avg
+            ])
+
+        print(
+            f"[TRAIN] epoch {epoch:03d} avg | "
+            f"loss={train_loss_avg:.4f}  | "
+            f"label_frac_avg={label_frac_avg:.3f}"
+        )
+
+    return model
+
+
+dataset_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\train.zarr"
+dataset = zarr3Ddataset(dataset_filename)
+train_dataset = Dataset(dataset, transform=train_trfm)
+loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
+
+model = train_smallUNet(
+    train_loader=loader,
+    val_loader=None,
+    device="cpu",
+    max_epochs=300,
+    checkpoint_path=r"C:\Users\bmahsa\Downloads\PreR_AllSamples\training_2d_smallUNet",
+    available_checkpoint=None
+)
