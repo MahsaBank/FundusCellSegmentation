@@ -188,7 +188,7 @@ def validate_model(
 
 
 if __name__ == "__main__":
-    checkpoint_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\training_2d\checkpoint_epoch_000.pth"
+    checkpoint_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\training_2d\best_model.pth"
     dataset_filename = r"C:\Users\bmahsa\Downloads\Best Images + ROIs\test_dataset.zarr"
     save_filename = r"C:\Users\bmahsa\Downloads\Best Images + ROIs\test_segmentation.zarr"
 
