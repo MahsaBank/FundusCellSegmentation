@@ -161,12 +161,10 @@ def propagate_cell_labels_by_hist(
                 add_ellipse_fn(out[z], top2, left2, hh, ww, value=10)
                 after = out[z].sum()
 
-                # reject tiny additions (optional safety)
+                # reject tiny additions
                 if (after - before) < min_new_area:
                     # undo if it added almost nothing
                     out[z] = out[z].copy()
-                    # (simple undo not possible without tracking; instead: skip min_new_area or track coords)
-                    # Recommended: track pixels written if you want strict undo.
                     pass
 
     return out
@@ -256,7 +254,7 @@ zarr_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\train.zarr"
 dataset = zarr.open(zarr_filename, mode='r')
 idx = 0
 key = list(dataset.keys())[idx]
-img = dataset[key]["raw"]          # (S, 512, 512)
+img = dataset[key]["raw"]          # (S,512,512)
 mask = dataset[key]["mask"]        # (S,512,512)
 
 f, ch = 1, 0
