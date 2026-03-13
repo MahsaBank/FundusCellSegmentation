@@ -1,0 +1,357 @@
+import numpy as np
+import zarr
+import math
+import torch
+import copy
+import torch.nn.functional as F
+from monai.data import Dataset, DataLoader
+from scipy.ndimage import distance_transform_edt
+from monai.transforms import (
+    Compose, SpatialPadd, ScaleIntensityRangePercentilesd,
+    RandCropByPosNegLabeld, RandFlipd, RandGaussianNoised, ToTensord
+)
+from monai.networks.nets import UNet
+from torch.optim import AdamW
+import os
+import csv
+import matplotlib.pyplot as plt
+
+def build_unet(in_channels=1, out_channels=1):
+    return UNet(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        spatial_dims=2,
+        channels=(32, 64, 128, 256, 512),
+        strides=(2, 2, 2, 2),
+        num_res_units=2,
+    )
+
+def make_label_valid(mask3d, safe_dis=12, radius=5):
+    mask3d = np.asarray(mask3d)
+    # mask3d = (mask3d > 0).astype(np.uint8)
+    # roi = mask3d.astype(bool)
+    label = (mask3d > 0).astype(np.float32)
+    valid = (mask3d == 1).astype(np.float32)
+
+    # Z, H, W = mask3d.shape
+    # valid = np.zeros((Z, H, W), dtype=np.float32)
+    # labeled_slices = np.where((mask3d.sum(axis=(1, 2))) > 0)[0]
+
+    # if radius > 0 and len(labeled_slices) > 0:
+    #     slice_w = np.zeros((Z,), dtype=np.float32)
+    #     for z0 in labeled_slices:
+    #         for dz in range(-radius, radius + 1):
+    #             z = z0 + dz
+    #             if 0 <= z < Z:
+    #                 w = max(0.0, 1.0 - abs(dz) / float(radius)) # linear decay
+    #                 slice_w[z] = max(slice_w[z], w)
+    #     valid = np.maximum(valid, slice_w[:, None, None])
+    
+    # valid[roi] = 1.0
+
+    # dis = distance_transform_edt(~roi)
+    # safe_bg = (dis > safe_dis) & ~roi
+
+    # valid[safe_bg] = 1.0 # safe negative
+    # label[safe_bg] = 0.0
+    
+    return label, valid
+
+
+class zarr3Ddataset(Dataset):
+    def __init__(self, zarr_path):
+        self.zarr_file = zarr.open(zarr_path, mode='r')
+        self.keys = list(self.zarr_file.keys())
+
+    def __len__(self):
+        return len(self.keys)
+    
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        grp = self.zarr_file[key]
+
+        mask3d = grp["mask"] # (S, H, W)
+        raw = grp["raw"]   # (S, H, W)
+
+        label, valid = make_label_valid(mask3d=mask3d)
+
+        label = (label.max(axis=0) > 0).astype(np.float32) # flatten volume to 2d
+        valid = (valid.max(axis=0) > 0).astype(np.float32)
+        raw_np = np.asarray(raw)
+        raw = (raw_np.max(axis=0)).astype(np.float32)
+
+        # norm_raw = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
+        # valid = ((norm_raw <= 0.06) | valid.astype(bool)).astype(np.float32)
+
+        label = np.expand_dims(label, axis=0)
+        valid = np.expand_dims(valid, axis=0)
+        raw = np.expand_dims(raw, axis=0)
+
+        return {"image": raw, "label":label, "valid":valid}
+
+
+PH, PW = 192, 192
+
+train_trfm = Compose([
+    SpatialPadd(keys=["image", "label", "valid"], spatial_size=(PH, PW), mode="constant"),
+    ScaleIntensityRangePercentilesd(keys="image", lower=5, upper=95, b_min=0.0, b_max=1.0, clip=True),
+    RandCropByPosNegLabeld(
+        keys=["image", "label", "valid"],
+        label_key="label",
+        spatial_size=(PH, PW),
+        pos=0.7, neg=0.3,
+        num_samples=4,
+    ),
+    RandFlipd(keys=["image", "label", "valid"], prob=0.5, spatial_axis=0), # H fliping
+    RandFlipd(keys=["image", "label", "valid"], prob=0.5, spatial_axis=1), # W fliping
+    RandGaussianNoised(keys="image", prob=0.2, mean=0.0, std=0.01),
+    ToTensord(keys=["image", "label", "valid"]),
+     ])
+
+
+@torch.no_grad()
+def ema_update(teacher, student, ema=0.99):
+    for s, t in zip(student.parameters(), teacher.parameters()):
+        t.data.mul_(ema).add_(s.data, alpha=1.0 - ema)
+
+def sigmoid_rampup(current, rampup_length):
+# @inproceedings{Tarvainen2017MeanTeacher,
+#   title={Mean teachers are better role models: Weight-averaged consistency targets improve semi-supervised deep learning results},
+#   author={Tarvainen, Antti and Valpola, Harri},
+#   booktitle={Advances in Neural Information Processing Systems},
+#   volume={30},
+#   year={2017}
+# }
+    if rampup_length == 0:
+        return 1.0
+    current = max(0.0, min(float(current), float(rampup_length)))
+    phase = 1.0 - current / rampup_length
+    return math.exp(-5.0 * phase * phase)
+
+
+def masked_bce_dice_loss(logits, target, valid, eps=1e-6):
+    # valid weights between 0 and 1. 0 means unknown
+    # size of inputs are (B, 1, H, W) 
+
+    bce_map = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    bce = (bce_map * valid).sum() / (valid.sum() + eps)
+
+    prob = torch.sigmoid(logits)
+    prob_w = prob * valid
+    targ_w = target * valid
+    inter = (prob_w * targ_w).sum()
+    denom = prob_w.sum() + targ_w.sum() + eps
+    dice = 1.0 - (2.0 * inter + eps) / denom
+
+    return bce + dice
+
+def consistency_loss(student_logits, teacher_logits, valid, eps=1e-6):
+    ps = torch.sigmoid(student_logits)
+    pt = torch.sigmoid(teacher_logits)
+    mse_map = (pt - ps) ** 2
+
+    unsup = (valid == 0.0).float() 
+
+    return (mse_map * unsup).sum() / (unsup.sum() + eps)
+
+
+def train_mean_teacher(
+    train_loader: DataLoader,
+    val_loader: DataLoader | None = None,
+    device: str = "cuda",
+    max_epochs: int = 200,
+    lr: float = 1e-4,
+    weight_decay: float = 1e-5,
+    ema: float = 0.99,
+    unsup_max_weight: float = 1.0,
+    unsup_rampup_iters: int = 2000,
+    log_every: int = 20,
+    checkpoint_path: str = "",
+    available_checkpoint=None
+):
+    os.makedirs(checkpoint_path, exist_ok=True)
+    bestmodel_filename = os.path.join(checkpoint_path, "best_model.pth")
+    csv_file = os.path.join(checkpoint_path, "metrics.csv")
+
+    # CSV header
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch", "global_step",
+            "train_loss_avg", "train_sup_avg", "train_cons_avg",
+            "val_loss_avg",
+            "lam", "valid_frac_avg"
+        ])
+
+    student = build_unet().to(device)
+    if available_checkpoint:
+        chk = torch.load(available_checkpoint, map_location=device)
+        student.load_state_dict(chk["student_state_dict"])
+
+    teacher = copy.deepcopy(student).to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    opt = AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
+
+    use_amp = device.startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    global_step = 0
+    best_score = float("inf")  # val if available else train
+
+    for epoch in range(max_epochs):
+        student.train()
+
+        run_loss = 0.0
+        run_sup = 0.0
+        run_cons = 0.0
+        run_valid_frac = 0.0
+        n_steps = 0
+
+        for step, batch in enumerate(train_loader):
+            x = batch["image"].to(device)
+            y = batch["label"].to(device)
+            v = batch["valid"].to(device)
+
+            if 0:
+                x_np = x.detach().cpu().numpy()[0][0] 
+                y_np = y.detach().cpu().numpy()[0][0]
+                v_np = v.detach().cpu().numpy()[0][0]
+                fig, ax = plt.subplots(1, 3, figsize=(9, 4))
+                ax[0].imshow(x_np, cmap="gray")
+                ax[0].imshow(y_np, alpha=0.3)
+                ax[1].imshow(y_np)
+                ax[2].imshow(v_np)
+                ax[0].set_title("image")
+                ax[1].set_title("label")
+                ax[2].set_title("valid")
+                plt.show()
+
+            # batch stats (averaged over epoch)
+            valid_frac = (v.sum() / (v.numel() + 1e-6)).item()
+            run_valid_frac += valid_frac
+
+            with torch.no_grad():
+                t_logits = teacher(x)
+
+            ramp = sigmoid_rampup(global_step, unsup_rampup_iters)
+            lam = unsup_max_weight * ramp
+
+            opt.zero_grad(set_to_none=True)
+
+            if use_amp:
+                with torch.cuda.amp.autocast(enabled=True):
+                    s_logits = student(x)
+                    L_sup = masked_bce_dice_loss(s_logits, y, v)
+                    L_cons = consistency_loss(s_logits, t_logits, v)
+                    loss = L_sup + lam * L_cons
+
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                s_logits = student(x)
+                L_sup = masked_bce_dice_loss(s_logits, y, v)
+                L_cons = consistency_loss(s_logits, t_logits, v)
+                loss = L_sup + lam * L_cons
+
+                loss.backward()
+                opt.step()
+
+            ema_update(teacher, student, ema=ema)
+
+            # accumulate epoch averages
+            run_loss += loss.item()
+            run_sup += L_sup.item()
+            run_cons += L_cons.item()
+            n_steps += 1
+
+            if (step % log_every) == 0:
+                pos_vox = (y > 0).sum().item()
+                print(
+                    f"epoch {epoch:03d} step {step:04d} | "
+                    f"loss={loss.item():.4f} sup={L_sup.item():.4f} cons={L_cons.item():.4f} | "
+                    f"lam={lam:.3f} valid_frac={valid_frac:.3f} pos_vox={pos_vox}"
+                )
+
+            global_step += 1
+
+        # compute averages
+        train_loss_avg = run_loss / max(n_steps, 1)
+        train_sup_avg = run_sup / max(n_steps, 1)
+        train_cons_avg = run_cons / max(n_steps, 1)
+        valid_frac_avg = run_valid_frac / max(n_steps, 1)
+
+        # validation once per epoch
+        val_loss_avg = None
+        if val_loader is not None:
+            student.eval()
+            vloss = 0.0
+            vsteps = 0
+            with torch.no_grad():
+                for vb in val_loader:
+                    vx = vb["image"].to(device)
+                    vy = vb["label"].to(device)
+                    vv = vb["valid"].to(device)
+                    vlogits = student(vx)
+                    L = masked_bce_dice_loss(vlogits, vy, vv)
+                    vloss += L.item()
+                    vsteps += 1
+            val_loss_avg = vloss / max(vsteps, 1)
+            print(f"[VAL] epoch {epoch:03d} loss={val_loss_avg:.4f}")
+
+        # checkpointing: save best by val if available
+        score = val_loss_avg if val_loss_avg is not None else train_loss_avg
+
+        checkpoint = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "student_state_dict": student.state_dict(),
+            "teacher_state_dict": teacher.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "best_score": best_score,
+        }
+
+        torch.save(checkpoint, os.path.join(checkpoint_path, f"checkpoint_epoch_{epoch:03d}.pth"))
+
+        if score < best_score:
+            best_score = score
+            checkpoint["best_score"] = best_score
+            torch.save(checkpoint, bestmodel_filename)
+            print(f"[BEST] epoch {epoch:03d} score={best_score:.4f} -> saved best_model.pth")
+
+        with open(csv_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch, global_step,
+                train_loss_avg, train_sup_avg, train_cons_avg,
+                val_loss_avg if val_loss_avg is not None else "",
+                lam, valid_frac_avg
+            ])
+
+        print(
+            f"[TRAIN] epoch {epoch:03d} avg | "
+            f"loss={train_loss_avg:.4f} sup={train_sup_avg:.4f} cons={train_cons_avg:.4f} | "
+            f"valid_frac_avg={valid_frac_avg:.3f}"
+        )
+
+    return student, teacher
+
+
+dataset_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\train.zarr"
+dataset = zarr3Ddataset(dataset_filename)
+train_dataset = Dataset(dataset, transform=train_trfm)
+loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
+student, teacher = train_mean_teacher(
+    train_loader=loader,
+    val_loader=None,
+    device="cpu",
+    max_epochs=300,
+    ema=0.99,
+    unsup_max_weight=0.5,
+    unsup_rampup_iters=2000,
+    checkpoint_path=r"C:\Users\bmahsa\Downloads\PreR_AllSamples\training_2d",
+    available_checkpoint=r"C:\Users\bmahsa\Downloads\PreR_AllSamples\training_2d\best_model.pth"
+)
