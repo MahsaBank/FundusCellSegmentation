@@ -52,14 +52,11 @@ class zarr3Ddataset(Dataset):
         else:
             mask = np.zeros_like(raw, dtype=np.uint8)
 
-        label, valid = make_label_valid(mask3d=mask3d)
         label = (label.max(axis=0) > 0).astype(np.float32) # flatten volume to 2d
-        valid = (valid.max(axis=0) > 0).astype(np.float32)
         raw_np = np.asarray(raw)
         raw = (raw_np.max(axis=0)).astype(np.float32)
 
         label = np.expand_dims(label, axis=0)
-        valid = np.expand_dims(valid, axis=0)
         raw = np.expand_dims(raw, axis=0)
 
         return {"image": raw, "label":label, "key":key}
