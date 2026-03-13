@@ -136,7 +136,7 @@ def validate_model(
     if do_student_unet:
         net = build_unet().to(device)
         net.load_state_dict(chk["student_state_dict"], strict=True)
-        ds = Zarr3DDataset(dataset_filename)
+        ds = zarr3Ddataset(dataset_filename)
     else:
         net = build_small_unet().to(device)
         net.load_state_dict(chk["network_state_dict"], strict=True)
