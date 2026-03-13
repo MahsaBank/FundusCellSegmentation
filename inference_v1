@@ -34,6 +34,36 @@ def build_small_unet(in_channels=1, out_channels=1):
     )
 
 
+class zarr3Ddataset(Dataset):
+    def __init__(self, zarr_path):
+        self.zarr_file = zarr.open(zarr_path, mode='r')
+        self.keys = list(self.zarr_file.keys())
+
+    def __len__(self):
+        return len(self.keys)
+    
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        grp = self.zarr_file[key]
+
+        raw = grp["raw"]   # (S, H, W)
+        if "mask" in grp:
+            mask = grp["mask"]  # (S, H, W)
+        else:
+            mask = np.zeros_like(raw, dtype=np.uint8)
+
+        label, valid = make_label_valid(mask3d=mask3d)
+        label = (label.max(axis=0) > 0).astype(np.float32) # flatten volume to 2d
+        valid = (valid.max(axis=0) > 0).astype(np.float32)
+        raw_np = np.asarray(raw)
+        raw = (raw_np.max(axis=0)).astype(np.float32)
+
+        label = np.expand_dims(label, axis=0)
+        valid = np.expand_dims(valid, axis=0)
+        raw = np.expand_dims(raw, axis=0)
+
+        return {"image": raw, "label":label, "key":key}
+
 class Zarr2DDataset(Dataset):
     def __init__(self, zarr_path):
         print(f"Loading dataset from: {zarr_path}")
@@ -105,16 +135,16 @@ def validate_model(
     # Load checkpoint
     chk = torch.load(checkpoint_filename, map_location=device)
 
-    # Build network
+    # Build network and Load dataset
     if do_student_unet:
         net = build_unet().to(device)
         net.load_state_dict(chk["student_state_dict"], strict=True)
+        ds = Zarr3DDataset(dataset_filename)
     else:
         net = build_small_unet().to(device)
         net.load_state_dict(chk["network_state_dict"], strict=True)
+        ds = Zarr2DDataset(dataset_filename)
 
-    # Load dataset
-    ds = Zarr2DDataset(dataset_filename)
     net.eval()
 
     test_ds = Dataset(ds, transform=trfm)
