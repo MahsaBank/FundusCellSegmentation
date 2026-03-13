@@ -54,13 +54,11 @@ class zarr3Ddataset(Dataset):
 
         label, valid = make_label_valid(mask3d=mask3d)
 
-        label = (label.max(axis=0) > 0).astype(np.float32) # flatten volume to 2d
+        # flatten 3D volumes into 2D representations
+        label = (label.max(axis=0) > 0).astype(np.float32)
         valid = (valid.max(axis=0) > 0).astype(np.float32)
         raw_np = np.asarray(raw)
         raw = (raw_np.max(axis=0)).astype(np.float32)
-
-        # norm_raw = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
-        # valid = ((norm_raw <= 0.06) | valid.astype(bool)).astype(np.float32)
 
         label = np.expand_dims(label, axis=0)
         valid = np.expand_dims(valid, axis=0)
