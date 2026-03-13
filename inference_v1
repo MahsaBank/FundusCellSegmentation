@@ -46,12 +46,13 @@ class zarr3Ddataset(Dataset):
         key = self.keys[idx]
         grp = self.zarr_file[key]
 
-        raw = grp["raw"]   # (S, H, W)
+        raw = grp["raw"][:]   # (S, H, W)
         if "mask" in grp:
-            mask = grp["mask"]  # (S, H, W)
+            mask = grp["mask"][:]  # (S, H, W)
         else:
             mask = np.zeros_like(raw, dtype=np.uint8)
 
+        label = (mask > 0).astype(np.uint8)
         label = (label.max(axis=0) > 0).astype(np.float32) # flatten volume to 2d
         raw_np = np.asarray(raw)
         raw = (raw_np.max(axis=0)).astype(np.float32)
@@ -187,7 +188,7 @@ def validate_model(
 
 
 if __name__ == "__main__":
-    checkpoint_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\train_smallUNet_2d\best_model.pth"
+    checkpoint_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\training_2d\checkpoint_epoch_000.pth"
     dataset_filename = r"C:\Users\bmahsa\Downloads\Best Images + ROIs\test_dataset.zarr"
     save_filename = r"C:\Users\bmahsa\Downloads\Best Images + ROIs\test_segmentation.zarr"
 
