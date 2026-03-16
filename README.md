@@ -442,7 +442,7 @@ student, teacher = train_mean_teacher(
     unsup_rampup_iters=2000,
 )
 ```
-## Key Hyperparameters
+### Key Hyperparameters
 |-----------|-------------|
 | Parameter |	Description |
 | max_epochs |	number of training epochs |
