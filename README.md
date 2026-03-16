@@ -2,7 +2,7 @@
 
 ## Overview
 
-`prepare_cell_dataset.py` builds a **Zarr dataset for cell segmentation training and testing** from:
+`prepare_cell_dataset.py` builds a **Zarr dataset for cell segmentation training** from:
 
 - TIFF image stacks (`.tif`)
 - ImageJ/Fiji ROI annotation files (`.zip`)
@@ -182,20 +182,6 @@ in the parent directory.
 Install required packages:
 ```python
 pip install numpy matplotlib scipy tifffile zarr read-roi
-```
-Required libraries:
-```python
-numpy
-
-matplotlib
-
-scipy
-
-tifffile
-
-zarr
-
-read-roi
 ```
 ## Notes
 
