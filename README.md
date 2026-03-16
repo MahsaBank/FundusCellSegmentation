@@ -21,14 +21,13 @@ The script expects a folder containing:
 - Corresponding TIFF image stacks (`*.tif`)
 
 Example structure:
-
-
+```
 PreR_AllSamples/
 ├── sample1.zip
 ├── sample1.tif
 ├── sample2.zip
 ├── sample2.tif
-
+```
 
 If ROI files start with `RoiSet`, the script automatically resolves the matching TIFF filename.
 
@@ -38,7 +37,7 @@ If ROI files start with `RoiSet`, the script automatically resolves the matching
 
 The script generates a Zarr dataset such as:
 
-
+```
 train.zarr
 ├── sample1
 │ ├── raw (Z, H, W)
@@ -46,7 +45,7 @@ train.zarr
 ├── sample2
 │ ├── raw
 │ └── mask
-
+```
 
 ### Stored arrays
 
