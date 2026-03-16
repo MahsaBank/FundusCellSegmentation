@@ -112,8 +112,9 @@ Where:
 - **W** → image width  
 
 The script currently selects **frame 1** for dataset creation:
+```python
 raw3d = img[1, :, :, :]
-
+```
 ## Visualization
 
 After building the dataset, the script loads one sample and displays an animated viewer showing image slices with mask overlays.
