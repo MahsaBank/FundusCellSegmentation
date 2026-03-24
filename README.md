@@ -203,19 +203,20 @@ This script is intended for preparing segmentation datasets when:
 
 ---
 
-# train_model_v1.py
+# train_model_vx.py
 
 ## Overview
 
-`train_model_v1.py` trains a **cell segmentation model** using a **Mean Teacher semi-supervised learning framework** implemented with **PyTorch and MONAI**.
+`train_model_vx.py` trains a **cell segmentation model** using a **Mean Teacher semi-supervised learning framework** implemented with **PyTorch and MONAI**.
 
 The training pipeline uses:
 
 - manually annotated cells as **supervised labels**
-- propagated labels from `read_data.py` as **unlabeled regions**
+- propagated labels from `prepare_cell_dataset.py` as **unlabeled regions**
 - a **student–teacher model architecture** to enforce consistency between predictions.
 
-The script trains a **2D U-Net segmentation network** using flattened projections of 3D volumes.
+The script `train_model_v4.py` trains a **2D U-Net segmentation network** using Z-planes of 3D volumes. 
+The script `train_model_v1.py` trains a **2D U-Net segmentation network** using flattened projections of 3D volumes.
 
 ---
 
@@ -265,7 +266,7 @@ During training:
 
 ## Data Preprocessing
 
-3D image volumes are converted into **2D representations** using maximum intensity projections:
+In `train_model_v1.py`, 3D image volumes are converted into **2D representations** using maximum intensity projections:
 
 ```python
 raw_2D = max(raw3d, axis=0)
@@ -316,6 +317,9 @@ Computed only on **valid labeled pixels**.
 
 ```python
 L_sup = BCE + Dice
+
+`train_model_v4.py` uses a weighted supervised loss:
+L_sup = bce_w * BCE + (1 - bce_w) * Dice
 ```
 
 ### Consistency Loss

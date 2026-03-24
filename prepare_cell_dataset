@@ -76,7 +76,7 @@ def propagate_cell_labels_by_hist(
     eps=1e-8,
 ):
     """
-    Returns updated_label3d (binary) with propagated labels.
+    Returns out (binary) with propagated labels.
     Strategy:
       For each cell labeled in slice z0:
         - compute reference patch around its center in raw3d[z0]
@@ -95,6 +95,9 @@ def propagate_cell_labels_by_hist(
     raw = raw3d.astype(np.float32)
 
     for c in cells:
+        if c["type"] != "ovel":
+            continue
+
         z0 = int(c["position"]["slice"])
         if not (0 <= z0 < Z):
             continue
@@ -171,6 +174,9 @@ def propagate_cell_labels_by_hist(
 
 def build_union_mask(cells, mask):
     for c in cells:
+        if c["type"] != "ovel":
+            continue
+
         top = c["top"]       # y
         left = c["left"]     # x
         h = c["height"]
@@ -247,10 +253,10 @@ def build_dataset(folder, zarr_name="training_dataset.zarr"):
     print("finished building dataset. items:", len(dataset))
 
 
-folder = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\PreR_AllSamples"
-build_dataset(folder=folder, zarr_name="train.zarr")
+folder = r"Z:\bmahsa\workplaces\CellFundusSegmentation\test_data_segmentation\CytoT2b"
+build_dataset(folder=folder, zarr_name="someSample_CytoT2b.zarr")
 
-zarr_filename = r"C:\Users\bmahsa\Downloads\PreR_AllSamples\train.zarr"
+zarr_filename = r"Z:\bmahsa\workplaces\CellFundusSegmentation\test_data_segmentation\someSample_CytoT2b.zarr"
 dataset = zarr.open(zarr_filename, mode='r')
 idx = 0
 key = list(dataset.keys())[idx]
